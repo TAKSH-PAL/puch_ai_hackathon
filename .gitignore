@@ -1,0 +1,51 @@
+# Python cache and build files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+*.manifest
+*.spec
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+*.env
+.env.*
+
+# IDE and editor settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Local config
+config.json
+secrets.json
+
+# PDF output from shareable route card tool
+*.pdf
+
+# Poetry files (if lock file shouldn't be tracked)
+# poetry.lock

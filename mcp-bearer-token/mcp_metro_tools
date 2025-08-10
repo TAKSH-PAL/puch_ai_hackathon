@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+import asyncio
+import os
+import re
+from typing import Annotated
+from datetime import datetime
+from dotenv import load_dotenv
+from fastmcp import FastMCP
+from fastmcp.server.auth.providers.bearer import BearerAuthProvider, RSAKeyPair
+from mcp import ErrorData, McpError
+from mcp.server.auth.provider import AccessToken
+from pydantic import BaseModel, Field
+import httpx
+from bs4 import BeautifulSoup
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+
+# --- Load environment variables ---
+load_dotenv()
+
+TOKEN = os.environ.get("AUTH_TOKEN")
+MY_NUMBER = os.environ.get("MY_NUMBER")
+
+assert TOKEN is not None, "Please set AUTH_TOKEN in your .env file"
+assert MY_NUMBER is not None, "Please set MY_NUMBER in your .env file"
+
+# --- Auth Provider ---
+class SimpleBearerAuthProvider(BearerAuthProvider):
+    def __init__(self, token: str):
+        k = RSAKeyPair.generate()
+        super().__init__(public_key=k.public_key, jwks_uri=None, issuer=None, audience=None)
+        self.token = token
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        if token == self.token:
+            return AccessToken(
+                token=token,
+                client_id="puch-client",
+                scopes=["*"],
+                expires_at=None,
+            )
+        return None
+
+# --- Rich Tool Description model ---
+class RichToolDescription(BaseModel):
+    description: str
+    use_when: str
+    side_effects: str | None = None
+
+# --- Helper utilities ---
+def slugify_station(name: str) -> str:
+    """
+    Convert a station name to the slug used on delhimetrorail.info,
+    e.g. "Mohan Nagar" -> "mohan-nagar-delhi-metro-station"
+    """
+    s = name.lower().strip()
+    s = re.sub(r"[^\w\s-]", "", s)
+    s = re.sub(r"\s+", "-", s)
+    s = s.replace("--", "-")
+    return f"{s}-delhi-metro-station"
+
+async def scrape_route_data(origin: str, destination: str, timeout: int = 15) -> dict:
+    """
+    Scrape delhimetrorail.info route page and extract:
+      - fare
+      - duration
+      - first/last train times
+      - stations sequence
+      - transfer (if present)
+    Raises McpError on failures.
+    """
+    origin_slug = slugify_station(origin)
+    dest_slug = slugify_station(destination)
+    route_url = f"https://delhimetrorail.info/{origin_slug}-to-{dest_slug}"
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(route_url, follow_redirects=True)
+    except httpx.HTTPError as e:
+        raise McpError(ErrorData(code=500, message=f"HTTP error fetching route page: {e!r}"))
+
+    if resp.status_code != 200:
+        raise McpError(ErrorData(code=500, message=f"Route page returned HTTP {resp.status_code}"))
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    fare = None
+    duration = None
+    first_train = None
+    last_train = None
+
+    # parse small summary table rows
+    for tr in soup.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 2:
+            continue
+        key = tds[0].get_text(" ", strip=True).lower()
+        val = tds[1].get_text(" ", strip=True)
+        if "fare" in key and not fare:
+            m = re.search(r"(\d{1,4})", val.replace(",", ""))
+            if m:
+                fare = m.group(1)
+        elif key.startswith("time") and not duration:
+            m = re.search(r"(\d{1,2}:\d{2}|\d{1,3})", val)
+            if m:
+                duration = m.group(1)
+        elif key.startswith("first") and not first_train:
+            first_train = val
+        elif key.startswith("last") and not last_train:
+            last_train = val
+
+    # extract stations from divCanvas
+    stations = []
+    transfer_at = None
+    div_canvas = soup.find(id="divCanvas")
+    if div_canvas:
+        # Collect station anchor texts in order
+        for a in div_canvas.find_all("a"):
+            text = a.get_text(" ", strip=True)
+            if text:
+                stations.append(text)
+
+        # Detect 'Change Train' marker (class IW) and map to nearest station afterwards
+        iw = div_canvas.find(class_="IW")
+        if iw:
+            nearest = None
+            found = False
+            # walk children of div_canvas, flag when we see IW, then find next <a>
+            for elem in div_canvas.children:
+                try:
+                    txt = elem.get_text(" ", strip=True) if hasattr(elem, "get_text") else ""
+                except Exception:
+                    txt = ""
+                if found:
+                    if hasattr(elem, "find"):
+                        a = elem.find("a")
+                        if a:
+                            nearest = a.get_text(" ", strip=True)
+                            break
+                # detect IW by text fallback
+                if "change train" in txt.lower():
+                    found = True
+            if not nearest and stations:
+                nearest = stations[len(stations)//2]
+            transfer_at = nearest
+
+    return {
+        "fare": fare,
+        "duration": duration,
+        "first_train": first_train,
+        "last_train": last_train,
+        "stations": stations,
+        "transfer_at": transfer_at,
+        "source_url": route_url,
+    }
+
+# --- MCP Server Setup ---
+mcp = FastMCP(
+    "Metro Tools MCP Server",
+    auth=SimpleBearerAuthProvider(TOKEN),
+)
+
+# --- Tool: validate (required by Puch) ---
+@mcp.tool
+async def validate() -> str:
+    return MY_NUMBER
+
+# --- Scraper tool (delhimetrorail.info) ---
+SCRAPE_DESC = RichToolDescription(
+    description="Scrape delhimetrorail.info for route fare, duration and station sequence (Delhi Metro).",
+    use_when="Use when you want DMRC-specific fare/time/station list without Google.",
+    side_effects="Performs HTTP requests to delhimetrorail.info. Respect robots.txt and rate limits."
+)
+
+@mcp.tool(description=SCRAPE_DESC.model_dump_json())
+async def metro_route_scrape(
+    origin: Annotated[str, Field(description="Origin station name")],
+    destination: Annotated[str, Field(description="Destination station name")]
+) -> dict:
+    data = await scrape_route_data(origin, destination)
+
+    md_lines = []
+    md_lines.append("**Metro Route (scraped)**")
+    md_lines.append(f"- **From:** {origin}")
+    md_lines.append(f"- **To:** {destination}")
+    if data.get("duration"):
+        md_lines.append(f"- 🕒 **Duration:** {data.get('duration')}")
+    if data.get("fare"):
+        md_lines.append(f"- 💰 **Fare:** ₹{data.get('fare')}")
+    if data.get("first_train"):
+        md_lines.append(f"- ⏱️ **First train:** {data.get('first_train')}")
+    if data.get("last_train"):
+        md_lines.append(f"- ⏱️ **Last train:** {data.get('last_train')}")
+    md_lines.append("")
+    if data.get("stations"):
+        md_lines.append("**Stations (in order):**")
+        stations = data.get("stations")
+        if len(stations) <= 12:
+            md_lines.append(" → ".join(stations))
+        else:
+            md_lines.append(" → ".join(stations[:6]) + " → ... → " + " → ".join(stations[-4:]))
+        if data.get("transfer_at"):
+            md_lines.append("")
+            md_lines.append(f"⚠️ Transfer at: {data.get('transfer_at')}")
+
+    result = {"summary_markdown": "\n".join(md_lines)}
+    result.update(data)
+    return result
+
+# --- Fare optimizer ---
+FARE_DESC = RichToolDescription(
+    description="Compute optimal fare breakdown for groups (adults/children) using scraped fare or simple rules.",
+    use_when="Use to calculate total cost for multiple passengers or concessions.",
+    side_effects="Reads fare from delhimetrorail.info if available; otherwise uses fallback estimate."
+)
+
+@mcp.tool(description=FARE_DESC.model_dump_json())
+async def fare_optimizer(
+    origin: Annotated[str, Field(description="Origin station name")],
+    destination: Annotated[str, Field(description="Destination station name")],
+    num_adults: Annotated[int, Field(description="Number of adult passengers")] = 1,
+    num_children: Annotated[int, Field(description="Number of child passengers (age-based concession) ")] = 0,
+    child_fare_share: Annotated[float, Field(description="Child pays this fraction of adult fare (default 0.5)")] = 0.5,
+) -> dict:
+    # get fare via scraper (best source)
+    try:
+        data = await scrape_route_data(origin, destination)
+        base_fare = int(data.get("fare")) if data.get("fare") else None
+    except McpError:
+        base_fare = None
+
+    # fallback estimate if no fare available
+    if base_fare is None:
+        base_fare = 20
+
+    adult_total = base_fare * num_adults
+    child_total = int(round(base_fare * child_fare_share)) * num_children
+    total = adult_total + child_total
+
+    breakdown = {
+        "base_fare_per_adult": base_fare,
+        "num_adults": num_adults,
+        "num_children": num_children,
+        "child_fare_share": child_fare_share,
+        "adult_total": adult_total,
+        "child_total": child_total,
+        "total": total,
+    }
+
+    md = []
+    md.append("**Fare Optimizer**")
+    md.append(f"- **Route:** {origin} → {destination}")
+    md.append(f"- **Base fare (per adult):** ₹{base_fare}")
+    md.append(f"- **Adults:** {num_adults} → ₹{adult_total}")
+    md.append(f"- **Children:** {num_children} (each pays {child_fare_share*100:.0f}% of adult fare) → ₹{child_total}")
+    md.append(f"- **Total:** ₹{total}")
+
+    return {"summary_markdown": "\n".join(md), **breakdown}
+
+# --- Station Accessibility Checker ---
+ACCESS_DESC = RichToolDescription(
+    description="Check accessibility features for a station (lifts, escalators, ramps, platform info) by scraping station page.",
+    use_when="Use when user needs to know if a station is accessible or has lifts/escalators.",
+    side_effects="Scrapes station page on delhimetrorail.info."
+)
+
+@mcp.tool(description=ACCESS_DESC.model_dump_json())
+async def station_accessibility(
+    station: Annotated[str, Field(description="Station name, e.g., 'Mohan Nagar'")]
+) -> dict:
+    slug = slugify_station(station).replace("-delhi-metro-station", "")
+    url = f"https://delhimetrorail.info/{slug}-delhi-metro-station"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
+    except httpx.HTTPError as e:
+        raise McpError(ErrorData(code=500, message=f"HTTP error fetching station page: {e!r}"))
+
+    if resp.status_code != 200:
+        raise McpError(ErrorData(code=500, message=f"Station page returned HTTP {resp.status_code}"))
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    text = soup.get_text(" ", strip=True).lower()
+
+    features = {
+        "lift": bool(re.search(r"\blift\b|\blifts\b", text)),
+        "escalator": bool(re.search(r"\bescalator\b|\bescalators\b", text)),
+        "ramp": bool(re.search(r"\bramp\b|\bramps\b", text)),
+        "parking": bool(re.search(r"\bparking\b", text)),
+        "platforms": None,
+    }
+
+    # try to extract platform/gate info from tables
+    platforms = []
+    for table in soup.find_all("table", class_="table"):
+        header = table.find("th")
+        if header and "gate" in header.get_text(" ", strip=True).lower():
+            for tr in table.find_all("tr")[1:]:
+                tds = tr.find_all("td")
+                if len(tds) >= 2:
+                    gate = tds[0].get_text(" ", strip=True)
+                    desc = tds[1].get_text(" ", strip=True)
+                    platforms.append({"gate": gate, "info": desc})
+    if platforms:
+        features["platforms"] = platforms
+
+    md = []
+    md.append(f"**Accessibility for {station}**")
+    md.append(f"- Lift(s): {'Yes' if features['lift'] else 'No'}")
+    md.append(f"- Escalator(s): {'Yes' if features['escalator'] else 'No'}")
+    md.append(f"- Ramp(s): {'Yes' if features['ramp'] else 'No'}")
+    md.append(f"- Parking info available: {'Yes' if features['parking'] else 'No'}")
+
+    return {"summary_markdown": "\n".join(md), **features, "source_url": url}
+
+# --- Shareable Route Card (PDF) ---
+PDF_DESC = RichToolDescription(
+    description="Generate a one-page PDF route card with route summary, fare, duration and station list.",
+    use_when="Use when you want a printable/shareable route card (PDF).",
+    side_effects="Creates a PDF file on disk and returns its filename."
+)
+
+@mcp.tool(description=PDF_DESC.model_dump_json())
+async def shareable_route_card(
+    origin: Annotated[str, Field(description="Origin station name")],
+    destination: Annotated[str, Field(description="Destination station name")],
+) -> str:
+    # gather scraped data (best effort)
+    try:
+        data = await scrape_route_data(origin, destination)
+    except McpError:
+        data = {"fare": 'N/A', "duration": 'N/A', "stations": [], "source_url": "delhimetrorail.info"}
+
+    # safe filename
+    safe_origin = re.sub(r"[^\w\-]", "_", origin)
+    safe_dest = re.sub(r"[^\w\-]", "_", destination)
+    filename = f"route_card_{safe_origin}_to_{safe_dest}_{int(datetime.now().timestamp())}.pdf"
+
+    # generate PDF
+    doc = SimpleDocTemplate(filename, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = []
+
+    title_style = ParagraphStyle('Title', parent=styles['Heading1'], alignment=1, fontSize=18)
+    normal = styles['Normal']
+
+    story.append(Paragraph(f"Route: {origin} → {destination}", title_style))
+    story.append(Spacer(1, 0.2*inch))
+
+    story.append(Paragraph(f"Duration: {data.get('duration', 'N/A')}", normal))
+    story.append(Paragraph(f"Fare: ₹{data.get('fare', 'N/A')}", normal))
+    story.append(Spacer(1, 0.15*inch))
+
+    stations = data.get('stations') or []
+    if stations:
+        story.append(Paragraph("Stations:", styles['Heading3']))
+        # add as a comma-separated paragraph (trim if very long)
+        if len(stations) > 50:
+            text = ", ".join(stations[:30]) + ", ... " + ", ".join(stations[-10:])
+        else:
+            text = ", ".join(stations)
+        story.append(Paragraph(text, normal))
+
+    story.append(Spacer(1, 0.2*inch))
+    story.append(Paragraph(f"Source: {data.get('source_url', 'delhimetrorail.info')}", styles['Italic']))
+
+    doc.build(story)
+
+    return filename
+
+# --- Run MCP Server ---
+async def main():
+    print("🚀 Starting MCP server on http://0.0.0.0:8086")
+    await mcp.run_async("streamable-http", host="0.0.0.0", port=8086)
+
+if __name__ == "__main__":
+    asyncio.run(main())
